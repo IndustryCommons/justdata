@@ -12,6 +12,11 @@ import shutil
 import pandas as pd
 import sqlalchemy
 import hashlib
+import psycopg2
+import xml.etree.ElementTree as ET
+from PyPDF2 import PdfReader
+from psycopg2 import sql
+from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from io import StringIO
 from streamlit_tags import st_tags
 from openai import OpenAI
@@ -20,46 +25,59 @@ from langchain_community.chat_models import ChatOpenAI
 from langchain.agents.agent_types import AgentType
 from langchain_experimental.agents import create_pandas_dataframe_agent
 from langchain.callbacks import StreamlitCallbackHandler
+from ydata_profiling import ProfileReport
+from streamlit_ydata_profiling import st_profile_report
+from pydantic_settings import BaseSettings
 
-# Create a subfolder named 'database' if it doesn't exist
-os.makedirs('database', exist_ok=True)
+# Connect to PostgreSQL database
+conn = psycopg2.connect(
+    dbname=st.secrets["postgres"]["database"],
+    user=st.secrets["postgres"]["user"],
+    password=st.secrets["postgres"]["password"],
+    host=st.secrets["postgres"]["host"],
+    port=st.secrets["postgres"]["port"],
+    sslmode=st.secrets["postgres"]["sslmode"],
+)
 
-# Connect to SQLite database
-conn = sqlite3.connect('database/justdata.db')
+# Create a cursor object
 c = conn.cursor()
 
 # Create table for users if it doesn't exist
 c.execute('''CREATE TABLE IF NOT EXISTS users
              (username TEXT PRIMARY KEY,
               password TEXT)''')
+# Commit the transaction
+conn.commit()
 
 # Create table if it doesn't exist
 c.execute('''CREATE TABLE IF NOT EXISTS annotations
-             (id INTEGER PRIMARY KEY AUTOINCREMENT,
+             (id SERIAL PRIMARY KEY,
               dataset_name TEXT,
               dataset_url TEXT,
               tags TEXT,
               justification TEXT,
-              file BLOB,
+              file BYTEA,
               file_name TEXT,
               username TEXT)''')
+
+# Commit the transaction
+conn.commit()
 
 # Function to verify login credentials
 def check_credentials(username, password, c):
     # Hash the entered password
     password_hash = hashlib.sha256(password.encode()).hexdigest()
-    
-    print(f"Login hash: {password_hash}")  # Debug line
-    
-    c.execute("SELECT * FROM users WHERE username=? AND password=?", (username, password_hash))
+    c.execute("SELECT * FROM users WHERE username=%s AND password=%s", (username, password_hash))
     if c.fetchone() is not None:
         return True
     return False
     
 # Create table for predefined tags if it doesn't exist; we also ensure that each tag is unique by asking SQLite to ignore the INSERT command in case of duplicate tags
 c.execute('''CREATE TABLE IF NOT EXISTS tags
-             (id INTEGER PRIMARY KEY AUTOINCREMENT,
+             (id SERIAL PRIMARY KEY,
               tag TEXT UNIQUE)''')
+# Commit the transaction
+conn.commit()
 
 # Function to register a new user
 def register_user(username, password, conn, c):
@@ -68,14 +86,14 @@ def register_user(username, password, conn, c):
     
     print(f"Register hash: {password_hash}")  # Debug line
     
-    c.execute("SELECT * FROM users WHERE username=?", (username,))
+    c.execute("SELECT * FROM users WHERE username=%s", (username,))
     if c.fetchone() is not None:
         st.warning("Username already exists. Please choose a different username.")
         st.stop()
     
     else:
         try:
-            c.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, password_hash))
+            c.execute("INSERT INTO users (username, password) VALUES (%s, %s)", (username, password_hash))
             conn.commit()
             st.success("Registered successfully. Please go to login.")
         except Exception as e:
@@ -87,7 +105,7 @@ def save_annotation(dataset_name, dataset_url, tags, justification, uploaded_fil
     # Read the uploaded file as bytes
     file_bytes = uploaded_file.read() if uploaded_file is not None else None
     file_name = uploaded_file.name if uploaded_file is not None else None  # Save the file name
-    c.execute("INSERT INTO annotations (dataset_name, dataset_url, tags, justification, file, file_name, username) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    c.execute("INSERT INTO annotations (dataset_name, dataset_url, tags, justification, file, file_name, username) VALUES (%s, %s, %s, %s, %s, %s, %s)",
               (dataset_name, dataset_url, tags, justification, file_bytes, file_name, username))
     conn.commit()
 
@@ -124,6 +142,8 @@ def export_annotations(username):
             
             # Save the uploaded file to a file
             if file_bytes is not None:
+                if isinstance(file_bytes, str):
+                    file_bytes = file_bytes.encode()  # Convert string to bytes
                 with open(f'annotations/{username}/annotation{id}_{file_name}', 'wb') as f:
                     f.write(file_bytes)
         else:
@@ -149,8 +169,14 @@ def export_annotations(username):
     shutil.rmtree('annotations')
 
 def create_download_link(row):
-    b64 = base64.b64encode(row['File']).decode()  # Convert file to base64 encoding
-    href = f'<a href="data:file/octet-stream;base64,{b64}" download="{row["File Name"]}">Download</a>'
+    if row['File'] is not None:
+        file_bytes = row['File']
+        if isinstance(file_bytes, str):
+            file_bytes = file_bytes.encode()  # Convert string to bytes
+        b64 = base64.b64encode(file_bytes).decode()  # Convert file to base64 encoding
+        href = f'<a href="data:file/octet-stream;base64,{b64}" download="{row["File Name"]}">Download</a>'
+    else:
+        href = 'No file'
     return href
 
 # Function to load dataset from a remote repository
@@ -262,43 +288,44 @@ def app(username):
         st.subheader("🤓Manage your tags")
         
         #Add tag
+        st.markdown("### ➕ Add Tag")
         new_tag = st.text_input("Add a new tag")
         if st.button("Add Tag"):
             if new_tag:
-                c.execute("INSERT OR IGNORE INTO tags (tag) VALUES (?)", (new_tag,))
+                c.execute("INSERT INTO tags (tag) VALUES (%s) ON CONFLICT (tag) DO NOTHING", (new_tag,))
                 conn.commit()
                 st.success("Tag added successfully!")
             else:
                 st.error("Please enter a tag.")
         
         #Delete tag
+        st.markdown("### ❌ Delete Tag")
         tag_to_delete = st.selectbox("Select a tag from the list to delete", predefined_tags)
         if st.button("Delete Tag"):
-            c.execute("DELETE FROM tags WHERE tag = ?", (tag_to_delete,))
+            c.execute("DELETE FROM tags WHERE tag = %s", (tag_to_delete,))
             conn.commit()
             st.success("Tag deleted successfully!")
         
         # Edit tag
+        st.markdown("### ✒️ Edit Tag")
         tag_to_edit = st.selectbox("Select a tag to edit it", predefined_tags)
-        edited_tag = st.text_input("New name for this tag", value=tag_to_edit)
+        edited_tag = st.text_input("Enter a new name for this tag", value=tag_to_edit)
         if st.button("Save changes"):
             if edited_tag:
-                c.execute("UPDATE tags SET tag = ? WHERE tag = ?", (edited_tag, tag_to_edit))
+                c.execute("UPDATE tags SET tag = %s WHERE tag = %s", (edited_tag, tag_to_edit))
                 conn.commit()
                 st.success("Tag updated successfully!")
             else:
                 st.error("Please enter a tag.")
 
     elif action == "Annotate Dataset":
-        
-        #st.sidebar.header("⚙️JUST Chatbot Settings")
         st.sidebar.markdown("## ⚙️JUST Chatbot Settings <small style='color: gray;'>🏷️BETA</small>", unsafe_allow_html=True)
-        st.sidebar.markdown("<small>Please enter your OpenAI API Key to unlock the JUST chatbot.</small>", unsafe_allow_html=True)
+        st.sidebar.markdown("<small>Enter your OpenAI API Key to activate the JUST chatbot powered by GPT-4 Turbo.</small>", unsafe_allow_html=True)
         with st.sidebar.form(key='chatbot_settings_form'):
             openai_api_key = st.text_input("OpenAI API Key", type="password")
             submit_button = st.form_submit_button(label='Submit')
 
-        st.sidebar.markdown("<small>Use the OpenAI API key provided in the documentation. This is an example of an API 🔑:<br>`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`</small>", unsafe_allow_html=True)
+        st.sidebar.markdown("<small>🔑 Use the OpenAI API key provided in the documentation.</small>", unsafe_allow_html=True)
 
         if 'chatbot_active' not in st.session_state:
                 st.session_state['chatbot_active'] = False
@@ -311,7 +338,6 @@ def app(username):
         dataset_name = st.text_input("Dataset Name", key='annotate_dataset_name')
         dataset_url = st.text_input("Dataset URL", key='annotate_dataset_url')
         tags = st.multiselect("Predefined tags", predefined_tags, key='annotate_tags')
-        #user_tags = st.text_input("User-defined tags (separated by commas)", key='annotate_user_tags')
         user_tags = st_tags(
             label='Enter your own tags',
             text='Press enter to add more',
@@ -328,13 +354,40 @@ def app(username):
             st.success("Annotation saved successfully!")
         
         if dataset_url:
-            df = pd.read_csv(dataset_url)
+            # Get the file extension
+            _, file_extension = os.path.splitext(dataset_url)
+
+            # Load the file based on its extension
+            if file_extension == '.csv':
+                df = pd.read_csv(dataset_url)
+            elif file_extension == '.xlsx':
+                df = pd.read_excel(dataset_url)
+            elif file_extension == '.json':
+                df = pd.read_json(dataset_url)
+            elif file_extension == '.pdf':
+                response = requests.get(dataset_url)
+                with open('temp.pdf', 'wb') as file:
+                    file.write(response.content)
+                with open('temp.pdf', 'rb') as file:
+                    pdf = PdfReader(file)
+                    text = ''
+                    for page in range(len(pdf.pages)):
+                        text += pdf.pages[page].extract_text()
+                    df = pd.DataFrame([text], columns=['Text'])
+                os.remove('temp.pdf')  # delete the temporary file
+            elif file_extension == '.xml':
+                response = requests.get(dataset_url)
+                tree = ET.ElementTree(ET.fromstring(response.content))
+                root = tree.getroot()
+                data = [{child.tag: child.text for child in root.iter()}]
+                df = pd.DataFrame(data)
+            else:
+                raise ValueError(f'Unsupported file type: {file_extension}')
 
             if submit_button:
                 st.session_state['chatbot_active'] = True
             
             if st.session_state['chatbot_active']:
-                #st.subheader("💬JUST explore and chat with your dataset")
                 st.markdown("### 💬JUST explore and chat with your dataset <small style='color: gray;'>🏷️BETA</small>", unsafe_allow_html=True)
                 st.dataframe(df) # Let's visualise the dataset
             # Initialize conversation history
@@ -357,7 +410,7 @@ def app(username):
 
                     # Initialize LLM
                     llm = ChatOpenAI(
-                        temperature=0, model="gpt-3.5-turbo-0613", openai_api_key=openai_api_key, streaming=True
+                        temperature=0, model="gpt-4-turbo", openai_api_key=openai_api_key, streaming=True
                     )
                 
                                 # Create a pandas dataframe agent
@@ -399,12 +452,6 @@ def app(username):
                 # Sort the DataFrame by 'Dataset Name'
                 df.sort_values('Dataset Name', inplace=True)
 
-                # Display annotations as a table
-                #st.table(df)
-                # Display annotations as a dataframe with a background gradient
-                #st.dataframe(df.style.background_gradient(cmap='viridis'))
-                # Display annotations as a dataframe with a background gradient
-
                 # Set CSS properties for th elements in dataframe
                 th_props = [
                     ('font-size', '13px'),
@@ -428,6 +475,23 @@ def app(username):
                 # Apply the styles to the DataFrame
                 df_styled = df.style.background_gradient(cmap='viridis').set_table_styles(styles)
                 st.markdown(df_styled.to_html(escape=False, index=False), unsafe_allow_html=True)
+
+                # Specify the columns you want to include in the report
+                columns_to_include = ['Tags', 'Justification']
+
+                # Generate a ProfileReport object for the specified columns
+                profile = ProfileReport(df[columns_to_include], title="Annotations Analytics", explorative=True,
+                        samples=None,
+                        correlations=None,
+                        missing_diagrams=None,
+                        duplicates=None,
+                        interactions=None,
+                )
+
+                # Display the ProfileReport
+                st.subheader("📈Annotations Stats")
+                st_profile_report(profile)
+                
             else:
                 st.warning("No annotations found.")
         else:
@@ -441,7 +505,8 @@ def app(username):
             st.success("Annotations exported to ZIP file!")
 
     # Add a footer
-    st.sidebar.markdown("© 2024 Industry Commons Foundation")
+    #st.sidebar.markdown("© 2024 Industry Commons Foundation")
+    st.sidebar.markdown("© 2024 [Industry Commons Foundation](https://www.industrycommons.net)")
 
     # Close database connection
     conn.close()
